@@ -1,0 +1,27 @@
+No stock no AI
+python news.py
+
+python news.py --use-lm-studio --lm-studio-model tinyllama-1.1b-chat-v1.0
+
+# Get news for a specific stock (e.g., Apple)
+python news.py --ticker AAPL
+
+# Get news for a stock with AI summary
+python news.py --ticker AAPL --use-lm-studio --lm-studio-model tinyllama-1.1b-chat-v1.0
+
+# Limit the number of headlines (default is 20)
+python news.py --limit 10
+
+# Save output to a file
+python news.py --output report.txt
+
+# Use AI summary with article reading (reads up to 5 articles)
+python news.py --use-lm-studio --lm-studio-model tinyllama-1.1b-chat-v1.0 --read-articles
+
+# Customize AI parameters
+python news.py --use-lm-studio --lm-studio-model tinyllama-1.1b-chat-v1.0 --temperature 0.5
+
+# Full featured: stock news with AI summary and article reading
+python news.py --ticker TSLA --use-lm-studio --lm-studio-model tinyllama-1.1b-chat-v1.0 --read-articles --article-limit 3 --max-article-chars 1500 --temperature 0.3 --output tesla_news.txt
+
+
