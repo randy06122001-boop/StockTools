@@ -5,6 +5,7 @@ import re
 import sys
 import textwrap
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 FINVIZ_MARKET_NEWS_URL = "https://finviz.com/news.ashx"
+FINVIZ_STOCK_QUOTE_URL = "https://finviz.com/quote.ashx"
 DEFAULT_LM_STUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 STOPWORDS = {
     "a", "about", "after", "all", "an", "and", "are", "as", "at", "be", "been",
@@ -46,6 +48,10 @@ class ArticleContext:
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def normalize_url(url: str, base_url: str) -> str:
+    return urllib.parse.urljoin(base_url, url)
 
 
 class FinvizMarketNewsParser(HTMLParser):
@@ -110,8 +116,76 @@ class FinvizMarketNewsParser(HTMLParser):
 
     @staticmethod
     def extract_source(url: str) -> str:
+        if url.startswith("/"):
+            url = normalize_url(url, FINVIZ_MARKET_NEWS_URL)
         cleaned = re.sub(r"^https?://", "", url)
         return cleaned.split("/")[0]
+
+
+class StockQuoteNewsParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_news_table = False
+        self.in_row = False
+        self.in_cell = False
+        self.current_cells: list[str] = []
+        self.items: list[NewsItem] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+
+        if tag == "table":
+            if attr_map.get("class") and "news-table" in attr_map.get("class", ""):
+                self.in_news_table = True
+
+        if self.in_news_table:
+            if tag == "tr":
+                self.in_row = True
+                self.current_cells = []
+            elif tag == "td":
+                self.in_cell = True
+            elif tag == "a" and self.in_cell:
+                href = attr_map.get("href", "")
+                if href:
+                    self.current_cells.append(("link", normalize_url(href, FINVIZ_STOCK_QUOTE_URL)))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "table":
+            self.in_news_table = False
+        elif tag == "tr" and self.in_row:
+            self.in_row = False
+            if len(self.current_cells) >= 3:
+                headline = None
+                time_label = None
+                url = None
+
+                for item in self.current_cells:
+                    if isinstance(item, tuple) and item[0] == "link":
+                        url = item[1]
+                    elif isinstance(item, str):
+                        if not time_label and re.match(r"^(\d{1,2}:\d{2}[AP]M|[A-Z][a-z]{2}-\d{2})$", item.strip()):
+                            time_label = item.strip()
+                        elif not headline and len(item.strip()) > 10:
+                            headline = item.strip()
+
+                if headline and time_label and url:
+                    source = re.sub(r"^https?://", "", url).split("/")[0]
+                    self.items.append(
+                        NewsItem(
+                            time_label=time_label,
+                            headline=headline,
+                            url=url,
+                            source=source,
+                        )
+                    )
+        elif tag == "td":
+            self.in_cell = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            text = clean_text(data)
+            if text:
+                self.current_cells.append(text)
 
 
 class ArticleTextParser(HTMLParser):
@@ -179,6 +253,32 @@ def fetch_market_news(limit: int) -> list[NewsItem]:
     items = parser.items[:limit]
     if not items:
         raise RuntimeError("No market news items were parsed. Finviz may have changed its layout.")
+    return items
+
+
+def fetch_stock_news(ticker: str, limit: int) -> list[NewsItem]:
+    url = f"{FINVIZ_STOCK_QUOTE_URL}?t={ticker.upper()}"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            content = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Finviz returned HTTP {exc.code} for ticker {ticker}.") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Unable to reach Finviz for ticker {ticker}: {exc.reason}") from exc
+
+    parser = StockQuoteNewsParser()
+    parser.feed(content)
+
+    items = parser.items[:limit]
+    if not items:
+        raise RuntimeError(
+            f"No news items were parsed for {ticker}. Ticker may not exist or Finviz may have changed its layout."
+        )
     return items
 
 
@@ -338,9 +438,17 @@ def generate_lm_studio_summary(
         raise RuntimeError("LM Studio response could not be parsed.") from exc
 
 
-def build_report(items: list[NewsItem], generated_at: datetime, ai_summary: str | None = None) -> str:
+def build_report(
+    items: list[NewsItem],
+    generated_at: datetime,
+    ai_summary: str | None = None,
+    ticker: str | None = None,
+) -> str:
     lines: list[str] = []
-    lines.append("FINVIZ MORNING MARKET NEWS REPORT")
+    if ticker:
+        lines.append(f"FINVIZ NEWS REPORT - {ticker.upper()}")
+    else:
+        lines.append("FINVIZ MORNING MARKET NEWS REPORT")
     lines.append(f"Generated: {generated_at.strftime('%Y-%m-%d %I:%M %p %Z')}")
     lines.append("")
 
@@ -370,6 +478,11 @@ def build_report(items: list[NewsItem], generated_at: datetime, ai_summary: str 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a morning market news report from Finviz."
+    )
+    parser.add_argument(
+        "--ticker",
+        type=str,
+        help="Specific stock ticker to get news for (e.g., AAPL). If not provided, fetches general market news.",
     )
     parser.add_argument(
         "--limit",
@@ -427,7 +540,10 @@ def main() -> int:
     args = parse_args()
 
     try:
-        items = fetch_market_news(limit=args.limit)
+        if args.ticker:
+            items = fetch_stock_news(ticker=args.ticker, limit=args.limit)
+        else:
+            items = fetch_market_news(limit=args.limit)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -452,7 +568,12 @@ def main() -> int:
         except Exception as exc:
             print(f"Warning: {exc}", file=sys.stderr)
 
-    report = build_report(items, datetime.now().astimezone(), ai_summary=ai_summary)
+    report = build_report(
+        items,
+        datetime.now().astimezone(),
+        ai_summary=ai_summary,
+        ticker=args.ticker,
+    )
     print(report)
 
     if args.output:
