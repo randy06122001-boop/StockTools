@@ -57,69 +57,63 @@ def normalize_url(url: str, base_url: str) -> str:
 class FinvizMarketNewsParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.in_news_block = False
-        self.capture_link = False
-        self.capture_time = False
-        self.current_href = ""
-        self.current_link_text: list[str] = []
-        self.current_time_text: list[str] = []
+        self.in_table = False
+        self.in_row = False
+        self.in_cell = False
+        self.cell_index = 0
+        self.current_cells: list[str] = []
         self.items: list[NewsItem] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attr_map = dict(attrs)
-
-        if tag == "a" and attr_map.get("href") == "news.ashx":
-            self.in_news_block = True
-            return
-
-        if not self.in_news_block:
-            return
-
-        if tag == "a":
-            href = attr_map.get("href", "") or ""
-            if href and href != "news.ashx":
-                self.capture_link = True
-                self.current_href = href
-                self.current_link_text = []
+        if tag == "table":
+            self.in_table = True
+        elif self.in_table and tag == "tr":
+            self.in_row = True
+            self.current_cells = []
+            self.cell_index = 0
+        elif self.in_row and tag == "td":
+            self.in_cell = True
+            self.cell_index += 1
+        elif self.in_cell and tag == "a":
+            href = dict(attrs).get("href", "")
+            if href:
+                self.current_cells.append(("link", normalize_url(href, FINVIZ_MARKET_NEWS_URL)))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "a" and self.capture_link:
-            headline = clean_text("".join(self.current_link_text))
-            if headline and self.current_time_text:
-                source = self.extract_source(self.current_href)
-                time_label = clean_text("".join(self.current_time_text))
-                self.items.append(
-                    NewsItem(
-                        time_label=time_label,
-                        headline=headline,
-                        url=self.current_href,
-                        source=source,
+        if tag == "table":
+            self.in_table = False
+        elif tag == "tr" and self.in_row:
+            self.in_row = False
+            if len(self.current_cells) >= 3:
+                time_label = None
+                headline = None
+                url = None
+                if len(self.current_cells) == 3:
+                    # Assume [time, ("link", url), headline]
+                    if isinstance(self.current_cells[0], str) and re.match(r"^(\d{1,2}:\d{2}[AP]M|[A-Z][a-z]{2}-\d{2})$", self.current_cells[0].strip()):
+                        time_label = self.current_cells[0].strip()
+                    if isinstance(self.current_cells[1], tuple) and self.current_cells[1][0] == "link":
+                        url = self.current_cells[1][1]
+                    if isinstance(self.current_cells[2], str):
+                        headline = self.current_cells[2].strip()
+                if headline and time_label and url:
+                    source = re.sub(r"^https?://", "", url).split("/")[0]
+                    self.items.append(
+                        NewsItem(
+                            time_label=time_label,
+                            headline=headline,
+                            url=url,
+                            source=source,
+                        )
                     )
-                )
-            self.capture_link = False
-            self.current_href = ""
-            self.current_link_text = []
-            self.current_time_text = []
+        elif tag == "td":
+            self.in_cell = False
 
     def handle_data(self, data: str) -> None:
-        if not self.in_news_block:
-            return
-
-        text = clean_text(data)
-        if not text:
-            return
-
-        if self.capture_link:
-            self.current_link_text.append(data)
-        elif re.match(r"^(\d{1,2}:\d{2}[AP]M|[A-Z][a-z]{2}-\d{2})$", text):
-            self.current_time_text.append(text)
-
-    @staticmethod
-    def extract_source(url: str) -> str:
-        if url.startswith("/"):
-            url = normalize_url(url, FINVIZ_MARKET_NEWS_URL)
-        cleaned = re.sub(r"^https?://", "", url)
-        return cleaned.split("/")[0]
+        if self.in_cell:
+            text = clean_text(data)
+            if text:
+                self.current_cells.append(text)
 
 
 class StockQuoteNewsParser(HTMLParser):
